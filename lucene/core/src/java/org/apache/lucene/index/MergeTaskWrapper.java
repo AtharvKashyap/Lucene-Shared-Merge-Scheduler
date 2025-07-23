@@ -1,44 +1,43 @@
 package org.apache.lucene.index;
 
 import java.util.concurrent.atomic.AtomicLong;
+import org.apache.lucene.index.MergeScheduler.MergeSource;
 
 /**
- * Runnable merge task that tracks its originating {@link IndexWriter}
+ * Runnable merge task that knows its originating {@link MergeSource}
  * and estimated merge size so it can be prioritised and accounted for.
  */
 public final class MergeTaskWrapper
     implements Runnable, Comparable<MergeTaskWrapper> {
 
-  private static final AtomicLong SEQ = new AtomicLong(); // FIFO tiebreaker
+  private static final AtomicLong SEQ = new AtomicLong();   // FIFO tiebreaker
 
   private final SharedMergeScheduler scheduler;
   private final Runnable             delegate;
-  private final IndexWriter          writer;
+  private final MergeSource          source;
   private final long                 mergeBytes;
   private final long                 seqNo;
 
   MergeTaskWrapper(SharedMergeScheduler scheduler,
                    Runnable delegate,
-                   IndexWriter writer,
+                   MergeSource source,
                    long mergeBytes) {
     this.scheduler  = scheduler;
     this.delegate   = delegate;
-    this.writer     = writer;
+    this.source     = source;
     this.mergeBytes = mergeBytes;
     this.seqNo      = SEQ.getAndIncrement();
   }
 
-  /** Executes the merge, then notifies the scheduler. */
   @Override
   public void run() {
     try {
       delegate.run();
     } finally {
-      scheduler.onTaskFinished(writer);
+      scheduler.onTaskFinished(source);
     }
   }
 
-  /** Order: smaller merges first, FIFO for equal sizes. */
   @Override
   public int compareTo(MergeTaskWrapper other) {
     int cmp = Long.compare(this.mergeBytes, other.mergeBytes);
@@ -46,8 +45,7 @@ public final class MergeTaskWrapper
                       : Long.compare(this.seqNo, other.seqNo);
   }
 
-  // --- getters handy for tests / diagnostics -------------------------------
-  public IndexWriter getWriter()     { return writer;     }
+  // test helpers
   public long        getMergeBytes() { return mergeBytes; }
   public long        getSeqNo()      { return seqNo;      }
 }

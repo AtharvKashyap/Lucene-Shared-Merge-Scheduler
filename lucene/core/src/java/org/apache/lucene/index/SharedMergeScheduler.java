@@ -6,41 +6,37 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * MergeScheduler that funnels all merges from every {@link IndexWriter}
+ * MergeScheduler that funnels merge work from **all** {@link IndexWriter}s
  * into a single shared {@link ExecutorService}.
  *
- * <p>Choose one of:<br>
- * • {@link #withDefault(int,int,boolean)} – merge-only pool<br>
- * • {@link IndexingMergeSharedExecutorService} – mixed indexing+merge pool<br>
- * – or supply any other ExecutorService you control.</p>
- *
- * <p>Back-pressure: when the queue is full the submitting indexing thread
- * executes the merge inline, naturally throttling that writer.</p>
+ * <p>Maps are keyed by {@link MergeScheduler.MergeSource}, which is the
+ * object IndexWriter passes back when merges are scheduled.  There is one
+ * MergeSource instance per writer, so this retains per-writer accounting
+ * without relying on casts.</p>
  */
 public class SharedMergeScheduler extends MergeScheduler {
 
-  private static final long MIN_BIG_MERGE_BYTES = 50L << 20; // 50 MB
+  private static final long MIN_BIG_MERGE_BYTES = 50L << 20;   // 50 MB
 
-  /** active merges per writer */
-  private final ConcurrentMap<IndexWriter, AtomicInteger> mergeCounts =
+  /** active merge tasks per writer (= per MergeSource) */
+  final ConcurrentMap<MergeSource, AtomicInteger> mergeCounts =
       new ConcurrentHashMap<>();
 
-  /** writers already closed, pending last merge completion */
-  private final ConcurrentMap<IndexWriter,Boolean> closedWriters =
+  /** writers (sources) that have closed but still own in-flight merges */
+  final ConcurrentMap<MergeSource, Boolean> closedSources =
       new ConcurrentHashMap<>();
 
   private final ExecutorService executor;
-  private final boolean shutdownOnClose;
+  private final boolean         shutdownOnClose;
 
-  // ------------------------------------------------------------------ ctor --
-
+  // ---------------------------------------------------------------- ctor ----
   public SharedMergeScheduler(ExecutorService executor,
                               boolean shutdownOnClose) {
-    this.executor         = Objects.requireNonNull(executor, "executor");
-    this.shutdownOnClose  = shutdownOnClose;
+    this.executor        = Objects.requireNonNull(executor, "executor");
+    this.shutdownOnClose = shutdownOnClose;
   }
 
-  /** Convenience factory: merge-only pool. */
+  /** Convenience factory that builds a merge-only pool. */
   public static SharedMergeScheduler withDefault(int threads,
                                                  int queueCapacity,
                                                  boolean prioritizeSmall) {
@@ -49,25 +45,22 @@ public class SharedMergeScheduler extends MergeScheduler {
     return new SharedMergeScheduler(es, /*shutdownOnClose=*/true);
   }
 
-  // ----------------------------------------------------------- MergeScheduler
-
+  // ------------------------------------------------------- MergeScheduler ----
   @Override
   public void merge(MergeSource source, MergeTrigger trigger) throws IOException {
-    IndexWriter writer = (IndexWriter) source; // IndexWriter implements MergeSource
 
     for (;;) {
       MergePolicy.OneMerge merge = source.getNextMerge();
       if (merge == null) break;
 
-      // track active count
-      mergeCounts.computeIfAbsent(writer, w -> new AtomicInteger())
+      mergeCounts.computeIfAbsent(source, s -> new AtomicInteger())
                  .incrementAndGet();
 
       Runnable logic = () -> {
         try {
           source.merge(merge);
 
-          // opportunistic drain of tiny merges (CMS behaviour)
+          // opportunistically drain tiny merges
           MergePolicy.OneMerge next;
           while ((next = source.getNextMerge()) != null
                  && next.totalBytesSize() < MIN_BIG_MERGE_BYTES) {
@@ -79,13 +72,12 @@ public class SharedMergeScheduler extends MergeScheduler {
       };
 
       MergeTaskWrapper task =
-          new MergeTaskWrapper(this, logic, writer, merge.totalBytesSize());
+          new MergeTaskWrapper(this, logic, source, merge.totalBytesSize());
 
       try {
         executor.execute(task);
-      } catch (RejectedExecutionException e) {
-        // queue full -> run inline (caller-runs)
-        task.run();
+      } catch (RejectedExecutionException ex) {
+        task.run();                 // caller-runs fallback
       }
     }
   }
@@ -105,23 +97,22 @@ public class SharedMergeScheduler extends MergeScheduler {
     }
   }
 
-  // ----------------------------------------------------------- writer hooks -
-
-  /** Called by {@link MergeTaskWrapper} after each task completes. */
-  void onTaskFinished(IndexWriter writer) {
-    AtomicInteger cnt = mergeCounts.get(writer);
-    if (cnt != null && cnt.decrementAndGet() == 0 && closedWriters.remove(writer) != null) {
-      mergeCounts.remove(writer);
+  // --------------------------------------------------- tracking helpers -----
+  /** package-private – called by MergeTaskWrapper when a task completes. */
+  void onTaskFinished(MergeSource source) {
+    AtomicInteger cnt = mergeCounts.get(source);
+    if (cnt != null && cnt.decrementAndGet() == 0 && closedSources.remove(source) != null) {
+      mergeCounts.remove(source);
     }
   }
 
-  /** Call from {@code IndexWriter.close()} to mark writer as finished. */
-  public void onWriterClosed(IndexWriter writer) {
-    closedWriters.put(writer, Boolean.TRUE);
-    AtomicInteger cnt = mergeCounts.get(writer);
+  /** Called from {@code IndexWriter.close()} to mark its MergeSource as finished. */
+  public void onWriterClosed(MergeSource source) {
+    closedSources.put(source, Boolean.TRUE);
+    AtomicInteger cnt = mergeCounts.get(source);
     if (cnt == null || cnt.get() == 0) {
-      mergeCounts.remove(writer);
-      closedWriters.remove(writer);
+      closedSources.remove(source);
+      mergeCounts.remove(source);
     }
   }
 }

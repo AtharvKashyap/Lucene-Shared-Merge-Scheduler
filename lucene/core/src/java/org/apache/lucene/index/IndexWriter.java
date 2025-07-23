@@ -1354,7 +1354,7 @@ public class IndexWriter
   public void close() throws IOException {
     MergeScheduler ms = config.getMergeScheduler();
     if (ms instanceof SharedMergeScheduler) {
-      ((SharedMergeScheduler) ms).onWriterClosed(this);
+      ((SharedMergeScheduler) ms).onWriterClosed(mergeSource);
     }
     if (config.getCommitOnClose()) {
       shutdown();
@@ -1362,7 +1362,6 @@ public class IndexWriter
       rollback();
     }
     ms.close();
-
   }
 
   // Returns true if this thread should attempt to close, or

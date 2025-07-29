@@ -1,34 +1,54 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.lucene.index;
 
-import org.apache.lucene.tests.analysis.MockAnalyzer;
-import org.apache.lucene.tests.util.LuceneTestCase;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.StringField;
-import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.IndexWriter;
-import org.apache.lucene.index.MergeTaskWrapper;
-import org.apache.lucene.index.SharedMergeScheduler;
-import org.apache.lucene.document.Field.Store;
-import org.apache.lucene.search.MatchAllDocsQuery;
-import org.apache.lucene.store.Directory;
-import org.junit.Test;
-
 import java.io.IOException;
-import org.apache.lucene.index.IndexingMergeSharedExecutorService;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.BooleanSupplier;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.tests.analysis.MockAnalyzer;
+import org.apache.lucene.tests.util.LuceneTestCase;
+import org.junit.Test;
 
 /** Unit-tests for {@link SharedMergeScheduler}. */
 public class TestSharedMergeScheduler extends LuceneTestCase {
 
-  /* ---------- helpers ---------- */
+  /* ---------- small helper ---------- */
+
+  /**
+   * Wait until {@code predicate.getAsBoolean()} is true or 10 s elapse. No Thread.sleep is used
+   * (forbidden); we spin with {@code Thread.onSpinWait()}.
+   */
+  private static void await(BooleanSupplier predicate) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    while (!predicate.getAsBoolean() && System.nanoTime() < deadline) {
+      Thread.onSpinWait();
+    }
+    assertTrue("timeout waiting for predicate", predicate.getAsBoolean());
+  }
 
   private IndexWriter newWriter(Directory dir, SharedMergeScheduler sms) throws IOException {
     return new IndexWriter(
-        dir,
-        newIndexWriterConfig(new MockAnalyzer(random()))
-            .setMergeScheduler(sms));
+        dir, newIndexWriterConfig(new MockAnalyzer(random())).setMergeScheduler(sms));
   }
 
   private static long countThreadsWithPrefix(String prefix) {
@@ -37,15 +57,7 @@ public class TestSharedMergeScheduler extends LuceneTestCase {
         .count();
   }
 
-  private static void await(BooleanSupplier predicate, long timeoutMillis) throws Exception {
-    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
-    while (!predicate.getAsBoolean() && System.nanoTime() < deadline) {
-      Thread.sleep(10);
-    }
-    assertTrue("timeout waiting for predicate", predicate.getAsBoolean());
-  }
-
-  /* ---------- TEST 1   basic round-trip ---------- */
+  /* ---------- TEST 1  basic round-trip ---------- */
 
   @Test
   public void testBasicIndexingAndSearch() throws Exception {
@@ -68,41 +80,39 @@ public class TestSharedMergeScheduler extends LuceneTestCase {
     }
   }
 
-/* ---------- TEST 2  thread-cap respected during heavy merges ---------- */
+  /* ---------- TEST 2  thread-cap respected ---------- */
 
-@Test
-public void testThreadCapRespected() throws Exception {
-  final int POOL = 3;
-  SharedMergeScheduler sms = SharedMergeScheduler.withDefault(POOL, 16, true);
+  @Test
+  public void testThreadCapRespected() throws Exception {
+    final int POOL = 3;
+    SharedMergeScheduler sms = SharedMergeScheduler.withDefault(POOL, 16, true);
 
-  List<Directory> dirs = new ArrayList<>();
-  List<IndexWriter> writers = new ArrayList<>();
-  try {
-    // each writer gets its own directory to avoid write.lock conflict
-    for (int i = 0; i < 8; i++) {
-      Directory d = newDirectory();
-      dirs.add(d);
-      writers.add(newWriter(d, sms));
-    }
-
-    for (int round = 0; round < 50; round++) {
-      for (IndexWriter w : writers) {
-        Document doc = new Document();
-        doc.add(new StringField("id", UUID.randomUUID().toString(), Store.NO));
-        w.addDocument(doc);
+    List<Directory> dirs = new ArrayList<>();
+    List<IndexWriter> writers = new ArrayList<>();
+    try {
+      for (int i = 0; i < 8; i++) {
+        Directory d = newDirectory();
+        dirs.add(d);
+        writers.add(newWriter(d, sms));
       }
+
+      for (int round = 0; round < 50; round++) {
+        for (IndexWriter w : writers) {
+          Document doc = new Document();
+          doc.add(new StringField("id", UUID.randomUUID().toString(), Store.NO));
+          w.addDocument(doc);
+        }
+      }
+
+      await(() -> countThreadsWithPrefix("lucene-shared-merge-") <= POOL + 1);
+    } finally {
+      for (IndexWriter w : writers) w.close();
+      for (Directory d : dirs) d.close();
+      sms.close();
     }
-
-    await(() -> countThreadsWithPrefix("lucene-shared-merge-") <= POOL + 1, 5000);
-  } finally {
-    for (IndexWriter w : writers) w.close();
-    for (Directory d : dirs) d.close();
-    sms.close();
   }
-}
 
-
-  /* ---------- TEST 3  per-writer merge-count cleanup ---------- */
+  /* ---------- TEST 3  per-writer cleanup ---------- */
 
   @Test
   public void testPerWriterCountsCleanedOnClose() throws Exception {
@@ -115,57 +125,57 @@ public void testThreadCapRespected() throws Exception {
         d.add(new StringField("id", Integer.toString(i), Store.NO));
         w.addDocument(d);
       }
-      w.flush();        // lots of segments
-      w.close();        // writer hook calls onWriterClosed
-      await(() -> sms.mergeCounts.isEmpty() && sms.closedSources.isEmpty(), 5000);
+      w.flush();
+      w.close();
+      await(() -> sms.mergeCounts.isEmpty() && sms.closedSources.isEmpty());
     } finally {
       sms.close();
       dir.close();
     }
   }
 
-/* ---------- TEST 4  caller-runs fallback when queue full ---------- */
+  /* ---------- TEST 4  caller-runs fallback ---------- */
 
-@Test
-public void testCallerRunsFallback() throws Exception {
-  // zero-length queue via SynchronousQueue
-  SharedMergeScheduler sms = SharedMergeScheduler.withDefault(1, 0, true);
-  Directory dir = newDirectory();
-  try {
-    IndexWriter w = newWriter(dir, sms);
-    long thrBefore = countThreadsWithPrefix("lucene-shared-merge-");
+  @Test
+  public void testCallerRunsFallback() throws Exception {
+    SharedMergeScheduler sms = SharedMergeScheduler.withDefault(1, 0, true);
+    Directory dir = newDirectory();
+    try {
+      IndexWriter w = newWriter(dir, sms);
+      long thrBefore = countThreadsWithPrefix("lucene-shared-merge-");
 
-    for (int i = 0; i < 500; i++) {
-      Document d = new Document();
-      d.add(new StringField("id", "x", Store.NO));
-      w.addDocument(d);
+      for (int i = 0; i < 500; i++) {
+        Document d = new Document();
+        d.add(new StringField("id", "x", Store.NO));
+        w.addDocument(d);
+      }
+      w.flush();
+      long thrAfter = countThreadsWithPrefix("lucene-shared-merge-");
+
+      assertTrue("no extra merge thread expected", thrAfter - thrBefore <= 1);
+      w.close();
+    } finally {
+      sms.close();
+      dir.close();
     }
-    w.flush();                    // triggers merge: queue is zero → caller-runs
-    long thrAfter = countThreadsWithPrefix("lucene-shared-merge-");
-
-    assertTrue("no extra merge thread expected", thrAfter - thrBefore <= 1);
-    w.close();
-  } finally {
-    sms.close();
-    dir.close();
   }
-}
-  /* ---------- TEST 5  small-merge priority comparator ---------- */
+
+  /* ---------- TEST 5  comparator ---------- */
 
   @Test
   public void testMergeTaskWrapperComparable() {
     MergeTaskWrapper small = new MergeTaskWrapper(null, () -> {}, null, 100);
-    MergeTaskWrapper big   = new MergeTaskWrapper(null, () -> {}, null, 1_000_000);
+    MergeTaskWrapper big = new MergeTaskWrapper(null, () -> {}, null, 1_000_000);
     assertTrue(small.compareTo(big) < 0);
     assertTrue(big.compareTo(small) > 0);
   }
 
-  /* ---------- TEST 6  executor is not shut down by writer close ---------- */
+  /* ---------- TEST 6  executor survives writer close ---------- */
 
   @Test
   public void testWriterCloseLeavesExecutorRunning() throws Exception {
     ExecutorService pool = MergeTasksExecutorService.newDefault(1, 8, true);
-    SharedMergeScheduler sms = new SharedMergeScheduler(pool, false); // we own shutdown
+    SharedMergeScheduler sms = new SharedMergeScheduler(pool, false);
     Directory dir = newDirectory();
     try {
       IndexWriter w = newWriter(dir, sms);
@@ -173,14 +183,14 @@ public void testCallerRunsFallback() throws Exception {
       d.add(new StringField("id", "a", Store.NO));
       w.addDocument(d);
       w.close();
-      assertFalse("executor must still be open", pool.isShutdown());
+      assertFalse(pool.isShutdown());
     } finally {
       pool.shutdownNow();
       dir.close();
     }
   }
 
-  /* ---------- TEST 7  index + merge share same pool ---------- */
+  /* ---------- TEST 7  shared pool ---------- */
 
   @Test
   public void testSharedPoolForIndexingAndMerging() throws Exception {
@@ -201,7 +211,7 @@ public void testCallerRunsFallback() throws Exception {
     }
   }
 
-  /* ---------- TEST 8  fairness: all writers finish merges ---------- */
+  /* ---------- TEST 8  fairness across 20 writers ---------- */
 
   @Test
   public void testFairnessTwentyWriters() throws Exception {
@@ -210,13 +220,11 @@ public void testCallerRunsFallback() throws Exception {
     List<Directory> dirs = new ArrayList<>();
     List<IndexWriter> writers = new ArrayList<>();
     try {
-      // create 20 writers on independent ram dirs
       for (int i = 0; i < 20; i++) {
         Directory d = newDirectory();
         dirs.add(d);
         writers.add(newWriter(d, sms));
       }
-      // index some docs
       for (IndexWriter w : writers) {
         for (int j = 0; j < 50; j++) {
           Document doc = new Document();
@@ -225,13 +233,10 @@ public void testCallerRunsFallback() throws Exception {
         }
         w.flush();
       }
-      // close writers (schedules final merges)
       for (IndexWriter w : writers) w.close();
 
-      // wait until executor terminates (sms.close polls awaitTermination)
       sms.close();
-      assertTrue("all writer entries cleared",
-                 sms.mergeCounts.isEmpty() && sms.closedSources.isEmpty());
+      assertTrue(sms.mergeCounts.isEmpty() && sms.closedSources.isEmpty());
     } finally {
       for (Directory d : dirs) d.close();
     }
